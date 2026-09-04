@@ -6,7 +6,7 @@ import type { Tool } from "@modelcontextprotocol/sdk/types.js"
 
 interface Env {
   MONEYMANI_API_URL: string
-  MCP_API_KEY: string
+  MONEYMANI_API_KEY: string
 }
 
 // ---------------------------------------------------------------------------
@@ -177,7 +177,7 @@ async function api(
     method,
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${env.MCP_API_KEY}`,
+      Authorization: `Bearer ${env.MONEYMANI_API_KEY}`,
     },
     body: body != null ? JSON.stringify(body) : undefined,
   })
@@ -377,9 +377,9 @@ export default {
       )
     }
 
-    // Auth — the same MCP_API_KEY is forwarded to the Next.js API
+    // Auth — the same MONEYMANI_API_KEY is forwarded to the Next.js API
     const auth = request.headers.get("Authorization") ?? ""
-    if (auth !== `Bearer ${env.MCP_API_KEY}`) {
+    if (auth !== `Bearer ${env.MONEYMANI_API_KEY}`) {
       return Response.json({ error: "Unauthorized" }, { status: 401, headers: CORS })
     }
 

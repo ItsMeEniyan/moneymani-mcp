@@ -4,6 +4,6 @@
 # Your deployed MoneyMani Vercel app URL (no trailing slash)
 MONEYMANI_API_URL="https://your-app.vercel.app"
 
-# Shared secret between this MCP server and the MoneyMani app
-# Generate one: openssl rand -hex 32
-MCP_API_KEY="your-secret-api-key"
+# Your personal API key — generate it from MoneyMani Settings → MCP Integration
+# It looks like: mm_xxxxxxxxxxxxxxxx...
+MONEYMANI_API_KEY="mm_your-key-from-settings"
