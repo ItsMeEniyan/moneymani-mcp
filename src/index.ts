@@ -1,4 +1,3 @@
-import { createClient, type SupabaseClient } from "@supabase/supabase-js"
 import type { Tool } from "@modelcontextprotocol/sdk/types.js"
 
 // ---------------------------------------------------------------------------
@@ -6,10 +5,8 @@ import type { Tool } from "@modelcontextprotocol/sdk/types.js"
 // ---------------------------------------------------------------------------
 
 interface Env {
-  SUPABASE_URL: string
-  SUPABASE_SERVICE_ROLE_KEY: string
-  USER_EMAIL: string
-  MCP_AUTH_KEY?: string
+  MONEYMANI_API_URL: string
+  MCP_API_KEY: string
 }
 
 // ---------------------------------------------------------------------------
@@ -31,7 +28,7 @@ interface MCPResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Tool catalogue (matches MCP spec — camelCase inputSchema)
+// Tool catalogue
 // ---------------------------------------------------------------------------
 
 const TOOLS: Tool[] = [
@@ -53,20 +50,20 @@ const TOOLS: Tool[] = [
   },
   {
     name: "list_transactions",
-    description: "List transactions with optional filters. Returns ID, type, category, amount, month, note.",
+    description: "List transactions with optional filters. Returns type, category, amount, month, note.",
     inputSchema: {
       type: "object",
       properties: {
         type: { type: "string", enum: ["INCOME", "EXPENSE", "SAVINGS"] },
         category: { type: "string" },
         month: { type: "string", description: "YYYY-MM format" },
-        limit: { type: "number", description: "Max results (default 20, max 100)" },
+        limit: { type: "number", description: "Max results (default 50, max 200)" },
       },
     },
   },
   {
     name: "delete_transaction",
-    description: "Delete a transaction by ID.",
+    description: "Delete a transaction by ID. Use list_transactions to find the ID first.",
     inputSchema: {
       type: "object",
       properties: { id: { type: "string" } },
@@ -75,7 +72,7 @@ const TOOLS: Tool[] = [
   },
   {
     name: "get_monthly_summary",
-    description: "Get income, expenses, savings, and net cash flow for a month.",
+    description: "Get income, expenses, savings, net cash flow, and top expense categories for a month.",
     inputSchema: {
       type: "object",
       properties: {
@@ -154,7 +151,7 @@ const TOOLS: Tool[] = [
   },
   {
     name: "delete_liability",
-    description: "Delete a liability by ID.",
+    description: "Delete a liability by ID. Use list_liabilities or get_net_worth to find the ID.",
     inputSchema: {
       type: "object",
       properties: { id: { type: "string" } },
@@ -164,16 +161,29 @@ const TOOLS: Tool[] = [
 ]
 
 // ---------------------------------------------------------------------------
-// Helpers
+// API helper — all calls go through the MoneyMani Vercel app
 // ---------------------------------------------------------------------------
 
-function formatINR(amount: number): string {
-  return new Intl.NumberFormat("en-IN", {
-    style: "currency",
-    currency: "INR",
-    minimumFractionDigits: 0,
-    maximumFractionDigits: 0,
-  }).format(amount)
+type ApiResponse = Record<string, unknown>
+
+async function api(
+  env: Env,
+  method: string,
+  path: string,
+  body?: unknown
+): Promise<ApiResponse> {
+  const url = `${env.MONEYMANI_API_URL.replace(/\/$/, "")}/api/mcp${path}`
+  const res = await fetch(url, {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${env.MCP_API_KEY}`,
+    },
+    body: body != null ? JSON.stringify(body) : undefined,
+  })
+  const data = (await res.json()) as ApiResponse
+  if (!res.ok) throw new Error((data.error as string | undefined) ?? `HTTP ${res.status}`)
+  return data
 }
 
 function currentMonth(): string {
@@ -181,273 +191,119 @@ function currentMonth(): string {
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`
 }
 
-function monthRange(ym: string): { start: string; end: string } {
-  const [y, m] = ym.split("-").map(Number)
-  return {
-    start: new Date(y, m - 1, 1).toISOString(),
-    end: new Date(y, m, 0, 23, 59, 59, 999).toISOString(),
-  }
-}
-
-async function getUserId(db: SupabaseClient, email: string): Promise<string> {
-  const { data, error } = await db.from("User").select("id").eq("email", email).single()
-  if (error || !data) throw new Error(`User not found: ${email}. Check USER_EMAIL env var.`)
-  return data.id
-}
-
 // ---------------------------------------------------------------------------
-// Tool handlers
+// Tool handlers — thin wrappers over the Next.js REST API
 // ---------------------------------------------------------------------------
 
 type Args = Record<string, unknown>
 
-async function addTransaction(args: Args, db: SupabaseClient, uid: string): Promise<string> {
+async function addTransaction(args: Args, env: Env): Promise<string> {
   const month = (args.month as string | undefined) ?? currentMonth()
-  const { error } = await db.from("Transaction").insert({
-    userId: uid,
+  const { message } = await api(env, "POST", "/transactions", {
     type: args.type,
     category: args.category,
     amount: args.amount,
-    date: new Date(`${month}-01`).toISOString(),
+    month,
     note: args.note ?? null,
-    createdAt: new Date().toISOString(),
   })
-  if (error) throw new Error(error.message)
-  return `Added ${args.type} · ${args.category} · ${formatINR(args.amount as number)} · ${month}`
+  return (message as string) ?? "Transaction added."
 }
 
-async function listTransactions(args: Args, db: SupabaseClient, uid: string): Promise<string> {
-  let q = db
-    .from("Transaction")
-    .select("id, type, category, amount, date, note")
-    .eq("userId", uid)
-    .order("date", { ascending: false })
-    .limit(Math.min((args.limit as number | undefined) ?? 20, 100))
-
-  if (args.type) q = q.eq("type", args.type)
-  if (args.category) q = q.eq("category", args.category)
-  if (args.month) {
-    const { start, end } = monthRange(args.month as string)
-    q = q.gte("date", start).lte("date", end)
-  }
-
-  const { data, error } = await q
-  if (error) throw new Error(error.message)
-  if (!data?.length) return "No transactions found."
-
-  return data
-    .map((t) => {
-      const mon = new Date(t.date).toLocaleDateString("en-IN", { month: "short", year: "numeric" })
-      const sign = t.type === "INCOME" ? "+" : t.type === "SAVINGS" ? "→" : "-"
-      return `[${t.id}] ${sign}${formatINR(t.amount)} | ${t.type} | ${t.category} | ${mon}${t.note ? ` | ${t.note}` : ""}`
-    })
-    .join("\n")
+async function listTransactions(args: Args, env: Env): Promise<string> {
+  const params = new URLSearchParams()
+  if (args.type) params.set("type", args.type as string)
+  if (args.category) params.set("category", args.category as string)
+  if (args.month) params.set("month", args.month as string)
+  if (args.limit) params.set("limit", String(args.limit))
+  const qs = params.toString()
+  const { message } = await api(env, "GET", `/transactions${qs ? `?${qs}` : ""}`)
+  return (message as string) ?? "No transactions found."
 }
 
-async function deleteTransaction(args: Args, db: SupabaseClient, uid: string): Promise<string> {
-  const { error } = await db.from("Transaction").delete().eq("id", args.id).eq("userId", uid)
-  if (error) throw new Error(error.message)
-  return "Transaction deleted."
+async function deleteTransaction(args: Args, env: Env): Promise<string> {
+  const { message } = await api(env, "DELETE", `/transactions/${args.id}`)
+  return (message as string) ?? "Transaction deleted."
 }
 
-async function getMonthlySummary(args: Args, db: SupabaseClient, uid: string): Promise<string> {
-  const ym = (args.month as string | undefined) ?? currentMonth()
-  const { start, end } = monthRange(ym)
-  const { data, error } = await db
-    .from("Transaction")
-    .select("type, amount")
-    .eq("userId", uid)
-    .gte("date", start)
-    .lte("date", end)
-
-  if (error) throw new Error(error.message)
-  const rows = data ?? []
-  const sum = (type: string) =>
-    rows.filter((r) => r.type === type).reduce((s, r) => s + Number(r.amount), 0)
-
-  const income = sum("INCOME")
-  const expenses = sum("EXPENSE")
-  const savings = sum("SAVINGS")
-  const cash = income - expenses
-  const [y, m] = ym.split("-").map(Number)
-  const label = new Date(y, m - 1, 1).toLocaleDateString("en-IN", { month: "long", year: "numeric" })
-
-  return [
-    `📊 ${label}`,
-    `Income:    ${formatINR(income)}`,
-    `Expenses:  ${formatINR(expenses)}`,
-    `Savings:   ${formatINR(savings)}`,
-    `Cash Flow: ${cash >= 0 ? "+" : ""}${formatINR(cash)}`,
-  ].join("\n")
+async function getMonthlySummary(args: Args, env: Env): Promise<string> {
+  const month = (args.month as string | undefined) ?? currentMonth()
+  const { message } = await api(env, "GET", `/summary?month=${month}`)
+  return (message as string) ?? "Summary retrieved."
 }
 
-async function getNetWorth(db: SupabaseClient, uid: string): Promise<string> {
-  const [{ data: sav }, { data: liab }] = await Promise.all([
-    db.from("Transaction").select("amount").eq("userId", uid).eq("type", "SAVINGS"),
-    db.from("Liability").select("name, amount, id").eq("userId", uid),
-  ])
-  const assets = (sav ?? []).reduce((s, r) => s + Number(r.amount), 0)
-  const liabilities = (liab ?? []).reduce((s, r) => s + Number(r.amount), 0)
-  const net = assets - liabilities
-  const liabLines = (liab ?? [])
-    .map((l) => `  [${l.id}] ${l.name}: ${formatINR(l.amount)}`)
-    .join("\n")
-
-  return [
-    `💰 Net Worth: ${formatINR(net)}`,
-    `Assets (total savings): ${formatINR(assets)}`,
-    `Liabilities total:      ${formatINR(liabilities)}`,
-    liabLines ? `\nLiabilities:\n${liabLines}` : "",
-  ]
-    .filter(Boolean)
-    .join("\n")
+async function getNetWorth(env: Env): Promise<string> {
+  const { message } = await api(env, "GET", "/networth")
+  return (message as string) ?? "Net worth retrieved."
 }
 
-async function createTrip(args: Args, db: SupabaseClient, uid: string): Promise<string> {
-  const { data, error } = await db
-    .from("Trip")
-    .insert({ userId: uid, name: args.name, status: "ACTIVE", createdAt: new Date().toISOString() })
-    .select("id")
-    .single()
-  if (error) throw new Error(error.message)
-  return `Trip "${args.name}" created.\nTrip ID: ${data.id}\nUse this ID to add expenses.`
+async function createTrip(args: Args, env: Env): Promise<string> {
+  const data = await api(env, "POST", "/trips", { name: args.name })
+  const msg = (data.message as string) ?? `Trip created.`
+  const tripId = data.tripId as string | undefined
+  return tripId ? `${msg}\nTrip ID: ${tripId}` : msg
 }
 
-async function listTrips(db: SupabaseClient, uid: string): Promise<string> {
-  const { data, error } = await db
-    .from("Trip")
-    .select("id, name, status, expenses:TripExpense(amount)")
-    .eq("userId", uid)
-    .order("createdAt", { ascending: false })
-  if (error) throw new Error(error.message)
-  if (!data?.length) return "No trips yet."
-
-  return (data as Array<{ id: string; name: string; status: string; expenses: Array<{ amount: number }> }>)
-    .map((t) => {
-      const total = t.expenses?.reduce((s, e) => s + Number(e.amount), 0) ?? 0
-      return `[${t.id}] ${t.name} | ${t.status} | ${formatINR(total)} | ${t.expenses?.length ?? 0} expenses`
-    })
-    .join("\n")
+async function listTrips(env: Env): Promise<string> {
+  const { message } = await api(env, "GET", "/trips")
+  return (message as string) ?? "No trips found."
 }
 
-async function getTrip(args: Args, db: SupabaseClient, uid: string): Promise<string> {
-  const { data: trip, error: te } = await db
-    .from("Trip")
-    .select("name, status")
-    .eq("id", args.trip_id)
-    .eq("userId", uid)
-    .single()
-  if (te || !trip) throw new Error("Trip not found.")
-
-  const { data: exps, error: ee } = await db
-    .from("TripExpense")
-    .select("id, category, amount, note")
-    .eq("tripId", args.trip_id)
-    .order("createdAt", { ascending: false })
-  if (ee) throw new Error(ee.message)
-
-  const rows = exps ?? []
-  const total = rows.reduce((s, e) => s + Number(e.amount), 0)
-  const catMap = new Map<string, number>()
-  for (const e of rows) catMap.set(e.category, (catMap.get(e.category) ?? 0) + Number(e.amount))
-
-  const breakdown = Array.from(catMap.entries())
-    .sort((a, b) => b[1] - a[1])
-    .map(([cat, amt]) => `  ${cat}: ${formatINR(amt)} (${total > 0 ? ((amt / total) * 100).toFixed(0) : 0}%)`)
-
-  const expLines = rows.map(
-    (e) => `  [${e.id}] ${e.category}: ${formatINR(e.amount)}${e.note ? ` — ${e.note}` : ""}`
-  )
-
-  return [
-    `✈️ ${trip.name} [${trip.status}]`,
-    `Total: ${formatINR(total)} across ${rows.length} expense${rows.length !== 1 ? "s" : ""}`,
-    "\nBy category:",
-    ...breakdown,
-    `\nExpenses:`,
-    ...(expLines.length ? expLines : ["  None yet."]),
-  ].join("\n")
+async function getTrip(args: Args, env: Env): Promise<string> {
+  const { message } = await api(env, "GET", `/trips/${args.trip_id}`)
+  return (message as string) ?? "Trip retrieved."
 }
 
-async function addTripExpense(args: Args, db: SupabaseClient, uid: string): Promise<string> {
-  const { data: trip, error: te } = await db
-    .from("Trip")
-    .select("name, status")
-    .eq("id", args.trip_id)
-    .eq("userId", uid)
-    .single()
-  if (te || !trip) throw new Error("Trip not found.")
-  if (trip.status === "COMPLETED") throw new Error("Cannot add expenses to a completed trip.")
-
-  const { error } = await db.from("TripExpense").insert({
-    tripId: args.trip_id,
+async function addTripExpense(args: Args, env: Env): Promise<string> {
+  const { message } = await api(env, "POST", `/trips/${args.trip_id}/expenses`, {
     category: args.category,
     amount: args.amount,
     note: args.note ?? null,
-    createdAt: new Date().toISOString(),
   })
-  if (error) throw new Error(error.message)
-  return `Added ${args.category}: ${formatINR(args.amount as number)} to "${trip.name}".`
+  return (message as string) ?? "Expense added."
 }
 
-async function endTrip(args: Args, db: SupabaseClient, uid: string): Promise<string> {
-  const { error } = await db
-    .from("Trip")
-    .update({ status: "COMPLETED" })
-    .eq("id", args.trip_id)
-    .eq("userId", uid)
-  if (error) throw new Error(error.message)
-  return "Trip marked as completed."
+async function endTrip(args: Args, env: Env): Promise<string> {
+  const { message } = await api(env, "PATCH", `/trips/${args.trip_id}/end`)
+  return (message as string) ?? "Trip ended."
 }
 
-async function addLiability(args: Args, db: SupabaseClient, uid: string): Promise<string> {
-  const { error } = await db.from("Liability").insert({
-    userId: uid,
+async function addLiability(args: Args, env: Env): Promise<string> {
+  const { message } = await api(env, "POST", "/liabilities", {
     name: args.name,
     amount: args.amount,
-    updatedAt: new Date().toISOString(),
   })
-  if (error) throw new Error(error.message)
-  return `Liability "${args.name}" added: ${formatINR(args.amount as number)}.`
+  return (message as string) ?? "Liability added."
 }
 
-async function listLiabilities(db: SupabaseClient, uid: string): Promise<string> {
-  const { data, error } = await db
-    .from("Liability")
-    .select("id, name, amount")
-    .eq("userId", uid)
-    .order("updatedAt", { ascending: false })
-  if (error) throw new Error(error.message)
-  if (!data?.length) return "No liabilities."
-  const total = data.reduce((s, l) => s + Number(l.amount), 0)
-  return [...data.map((l) => `[${l.id}] ${l.name}: ${formatINR(l.amount)}`), `\nTotal: ${formatINR(total)}`].join("\n")
+async function listLiabilities(env: Env): Promise<string> {
+  const { message } = await api(env, "GET", "/liabilities")
+  return (message as string) ?? "No liabilities found."
 }
 
-async function deleteLiability(args: Args, db: SupabaseClient, uid: string): Promise<string> {
-  const { error } = await db.from("Liability").delete().eq("id", args.id).eq("userId", uid)
-  if (error) throw new Error(error.message)
-  return "Liability deleted."
+async function deleteLiability(args: Args, env: Env): Promise<string> {
+  const { message } = await api(env, "DELETE", `/liabilities/${args.id}`)
+  return (message as string) ?? "Liability deleted."
 }
 
 // ---------------------------------------------------------------------------
 // Tool dispatcher
 // ---------------------------------------------------------------------------
 
-async function callTool(name: string, args: Args, db: SupabaseClient, uid: string): Promise<string> {
+async function callTool(name: string, args: Args, env: Env): Promise<string> {
   switch (name) {
-    case "add_transaction":    return addTransaction(args, db, uid)
-    case "list_transactions":  return listTransactions(args, db, uid)
-    case "delete_transaction": return deleteTransaction(args, db, uid)
-    case "get_monthly_summary": return getMonthlySummary(args, db, uid)
-    case "get_net_worth":      return getNetWorth(db, uid)
-    case "create_trip":        return createTrip(args, db, uid)
-    case "list_trips":         return listTrips(db, uid)
-    case "get_trip":           return getTrip(args, db, uid)
-    case "add_trip_expense":   return addTripExpense(args, db, uid)
-    case "end_trip":           return endTrip(args, db, uid)
-    case "add_liability":      return addLiability(args, db, uid)
-    case "list_liabilities":   return listLiabilities(db, uid)
-    case "delete_liability":   return deleteLiability(args, db, uid)
+    case "add_transaction":    return addTransaction(args, env)
+    case "list_transactions":  return listTransactions(args, env)
+    case "delete_transaction": return deleteTransaction(args, env)
+    case "get_monthly_summary": return getMonthlySummary(args, env)
+    case "get_net_worth":      return getNetWorth(env)
+    case "create_trip":        return createTrip(args, env)
+    case "list_trips":         return listTrips(env)
+    case "get_trip":           return getTrip(args, env)
+    case "add_trip_expense":   return addTripExpense(args, env)
+    case "end_trip":           return endTrip(args, env)
+    case "add_liability":      return addLiability(args, env)
+    case "list_liabilities":   return listLiabilities(env)
+    case "delete_liability":   return deleteLiability(args, env)
     default: throw new Error(`Unknown tool: ${name}`)
   }
 }
@@ -470,7 +326,7 @@ async function handleMCP(req: MCPRequest, env: Env): Promise<MCPResponse> {
         return ok({
           protocolVersion: "2024-11-05",
           capabilities: { tools: {} },
-          serverInfo: { name: "MoneyMani", version: "1.0.0" },
+          serverInfo: { name: "MoneyMani", version: "2.0.0" },
         })
 
       case "notifications/initialized":
@@ -486,9 +342,7 @@ async function handleMCP(req: MCPRequest, env: Env): Promise<MCPResponse> {
           name: string
           arguments?: Args
         }
-        const db = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY)
-        const uid = await getUserId(db, env.USER_EMAIL)
-        const text = await callTool(name, args, db, uid)
+        const text = await callTool(name, args, env)
         return ok({ content: [{ type: "text", text }] })
       }
 
@@ -516,20 +370,17 @@ export default {
 
     const url = new URL(request.url)
 
-    // Health / info
     if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
       return Response.json(
-        { name: "MoneyMani MCP Server", version: "1.0.0", protocol: "2024-11-05", status: "ok" },
+        { name: "MoneyMani MCP Server", version: "2.0.0", protocol: "2024-11-05", status: "ok" },
         { headers: CORS }
       )
     }
 
-    // Auth
-    if (env.MCP_AUTH_KEY) {
-      const auth = request.headers.get("Authorization") ?? ""
-      if (auth !== `Bearer ${env.MCP_AUTH_KEY}`) {
-        return Response.json({ error: "Unauthorized" }, { status: 401, headers: CORS })
-      }
+    // Auth — the same MCP_API_KEY is forwarded to the Next.js API
+    const auth = request.headers.get("Authorization") ?? ""
+    if (auth !== `Bearer ${env.MCP_API_KEY}`) {
+      return Response.json({ error: "Unauthorized" }, { status: 401, headers: CORS })
     }
 
     if (request.method !== "POST") {

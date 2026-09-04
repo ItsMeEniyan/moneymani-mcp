@@ -1,12 +1,9 @@
 # Copy this to .dev.vars for local development (gitignored)
 # For production, set these via: wrangler secret put <KEY>
 
-# From Supabase → Settings → API
-SUPABASE_URL="https://xxxx.supabase.co"
-SUPABASE_SERVICE_ROLE_KEY="eyJ..."
+# Your deployed MoneyMani Vercel app URL (no trailing slash)
+MONEYMANI_API_URL="https://your-app.vercel.app"
 
-# Your MoneyMani account email — all queries are scoped to this user
-USER_EMAIL="your@email.com"
-
-# Optional: protect the MCP endpoint with a bearer token
-# MCP_AUTH_KEY="your-secret-key"
+# Shared secret between this MCP server and the MoneyMani app
+# Generate one: openssl rand -hex 32
+MCP_API_KEY="your-secret-api-key"
