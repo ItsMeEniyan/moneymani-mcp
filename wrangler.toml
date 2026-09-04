@@ -1,0 +1,8 @@
+name = "moneymani-mcp"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+compatibility_flags = ["nodejs_compat_v2"]
+
+[vars]
+# Non-secret defaults — override sensitive values with `wrangler secret put`
+# USER_EMAIL = "your@email.com"
